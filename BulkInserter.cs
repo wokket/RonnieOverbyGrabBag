@@ -3,6 +3,8 @@
  * and part of the Ronnie Overby Grab Bag: https://github.com/ronnieoverby/RonnieOverbyGrabBag
  */
 
+// Wokket 2020-01-24: Updated to async/await
+
 using System;
 using System.Collections.Generic;
 using System.Data;
@@ -15,7 +17,7 @@ using System.Reflection;
 namespace Overby.Data
 // ReSharper restore CheckNamespace
 {
-    public class BulkInsertEventArgs<T> : EventArgs
+       public class BulkInsertEventArgs<T> : EventArgs
     {
 
         public T[] Items { get; private set; }
@@ -23,8 +25,8 @@ namespace Overby.Data
 
         public BulkInsertEventArgs(T[] items, DataTable dataTable)
         {
-            if (items == null) throw new ArgumentNullException("items");
-            if (dataTable == null) throw new ArgumentNullException("dataTable");
+            if (items == null) throw new ArgumentNullException(nameof(items));
+            if (dataTable == null) throw new ArgumentNullException(nameof(dataTable));
             Items = items.ToArray();
             DataTable = dataTable;
         }
@@ -33,7 +35,7 @@ namespace Overby.Data
     /// <summary>
     /// Performs buffered bulk inserts into a sql server table using objects instead of DataRows. :)
     /// </summary>
-    public class BulkInserter<T> : IDisposable where T : class
+    public sealed class BulkInserter<T> : IDisposable where T : class
     {
 
         public string[] RemoveColumns { get; set; }
@@ -42,15 +44,13 @@ namespace Overby.Data
         public event EventHandler<BulkInsertEventArgs<T>> PreBulkInsert;
         public void OnPreBulkInsert(BulkInsertEventArgs<T> e)
         {
-            var handler = PreBulkInsert;
-            if (handler != null) handler(this, e);
+            PreBulkInsert?.Invoke(this, e);
         }
 
         public event EventHandler<BulkInsertEventArgs<T>> PostBulkInsert;
         public void OnPostBulkInsert(BulkInsertEventArgs<T> e)
         {
-            var handler = PostBulkInsert;
-            if (handler != null) handler(this, e);
+            PostBulkInsert?.Invoke(this, e);
         }
 
         private const int DefaultBufferSize = 2000;
@@ -75,8 +75,8 @@ namespace Overby.Data
         /// <param name="bufferSize">Number of rows to bulk insert at a time. The default is 2000.</param>
         public BulkInserter(SqlConnection connection, SqlBulkCopy sqlBulkCopy, int bufferSize = DefaultBufferSize)
         {
-            if (connection == null) throw new ArgumentNullException("connection");
-            if (sqlBulkCopy == null) throw new ArgumentNullException("sqlBulkCopy");
+            if (connection == null) throw new ArgumentNullException(nameof(connection));
+            if (sqlBulkCopy == null) throw new ArgumentNullException(nameof(sqlBulkCopy));
 
             _bufferSize = bufferSize;
             _connection = connection;
@@ -101,9 +101,9 @@ namespace Overby.Data
         /// Performs buffered bulk insert of enumerable items.
         /// </summary>
         /// <param name="items">The items to be inserted.</param>
-        public void Insert(IEnumerable<T> items)
+        public async Task InsertAsync(IEnumerable<T> items)
         {
-            if (items == null) throw new ArgumentNullException("items");
+            if (items == null) throw new ArgumentNullException(nameof(items));
 
             // get columns that have a matching property
             var cols = _dt.Value.Columns.Cast<DataColumn>()
@@ -119,7 +119,9 @@ namespace Overby.Data
                     var row = _dt.Value.NewRow();
 
                     foreach (var col in cols)
+                    {
                         row[col.Column] = col.Getter(item) ?? DBNull.Value;
+                    }
 
                     _dt.Value.Rows.Add(row);
                 }
@@ -128,9 +130,11 @@ namespace Overby.Data
                 OnPreBulkInsert(bulkInsertEventArgs);
 
                 if (BulkCopyTimeout.HasValue)
+                {
                     _sbc.BulkCopyTimeout = (int)BulkCopyTimeout.Value.TotalSeconds;
+                }
 
-                _sbc.WriteToServer(_dt.Value);
+                await _sbc.WriteToServerAsync(_dt.Value).ConfigureAwait(false);
 
                 OnPostBulkInsert(bulkInsertEventArgs);
 
@@ -139,18 +143,23 @@ namespace Overby.Data
             }
         }
 
-        public static IEnumerable<IEnumerable<T>> Buffer(IEnumerable<T> source, int bufferSize)
+        private static IEnumerable<IEnumerable<T>> Buffer(IEnumerable<T> source, int bufferSize)
         {
+
             using (var enumerator = source.GetEnumerator())
                 while (enumerator.MoveNext())
+                {
                     yield return YieldBufferElements(enumerator, bufferSize - 1);
+                }
         }
 
         private static IEnumerable<T> YieldBufferElements(IEnumerator<T> source, int bufferSize)
         {
             yield return source.Current;
             for (var i = 0; i < bufferSize && source.MoveNext(); i++)
+            {
                 yield return source.Current;
+            }
         }
 
         /// <summary>
@@ -158,22 +167,28 @@ namespace Overby.Data
         /// Call Flush() to manually bulk insert the currently queued items.
         /// </summary>
         /// <param name="item">The item to be inserted.</param>
-        public void Insert(T item)
+        public Task InsertAsync(T item)
         {
-            if (item == null) throw new ArgumentNullException("item");
+            if (item == null) throw new ArgumentNullException(nameof(item));
 
             _queue.Add(item);
 
             if (_queue.Count == _bufferSize)
-                Flush();
+            {
+                return FlushAsync();
+            }
+            else
+            {
+                return Task.CompletedTask;
+            }
         }
 
         /// <summary>
         /// Bulk inserts the currently queued items.
         /// </summary>
-        public void Flush()
+        public async Task FlushAsync()
         {
-            Insert(_queue);
+            await InsertAsync(_queue).ConfigureAwait(false);
             _queue.Clear();
         }
 
@@ -193,7 +208,9 @@ namespace Overby.Data
         private static Func<T, object> CreatePropertyGetter(PropertyInfo propertyInfo)
         {
             if (typeof(T) != propertyInfo.DeclaringType)
-                throw new ArgumentException();
+                throw new ArgumentException(
+                    $"Mismatched types between that requested ({typeof(T).Name}), and that returned by the property ({propertyInfo.DeclaringType.Name}).",
+                    propertyInfo.Name);
 
             var instance = Expression.Parameter(propertyInfo.DeclaringType, "i");
             var property = Expression.Property(instance, propertyInfo);
@@ -201,13 +218,20 @@ namespace Overby.Data
             return (Func<T, object>)Expression.Lambda(convert, instance).Compile();
         }
 
+        /// <summary>
+        /// Creates and returns a datatable representing the target columns we need to insert data into.
+        /// </summary>
+        /// <remarks>This does NOT contains columns for anything in the `RemoveColumns` collection.</remarks>
+        /// <returns></returns>
         private DataTable CreateDataTable()
         {
             var dt = new DataTable();
+
+            // get the target shape of the table
             using (var cmd = _connection.CreateCommand())
             {
                 cmd.Transaction = _tran;
-                cmd.CommandText = string.Format("select top 0 * from {0}", _sbc.DestinationTableName);
+                cmd.CommandText = $"select top 0 * from {_sbc.DestinationTableName}";
 
                 using (var reader = cmd.ExecuteReader())
                     dt.Load(reader);
