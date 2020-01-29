@@ -4,6 +4,9 @@
  */
 
 // Wokket 2020-01-24: Updated to async/await
+// Wokket 2020-01-29: Updated to non-nullable reference types, fixed a bunch of fxcop warnings.
+
+#nullable enable
 
 using System;
 using System.Collections.Generic;
@@ -12,23 +15,20 @@ using System.Data.SqlClient;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Threading.Tasks;
 
-// ReSharper disable CheckNamespace
-namespace Overby.Data
-// ReSharper restore CheckNamespace
+namespace netcore_31_template
 {
-       public class BulkInsertEventArgs<T> : EventArgs
+    public class BulkInsertEventArgs<T> : EventArgs
     {
 
-        public T[] Items { get; private set; }
-        public DataTable DataTable { get; set; }
+        public IEnumerable<T> Items { get; }
+        public DataTable DataTable { get; }
 
         public BulkInsertEventArgs(T[] items, DataTable dataTable)
         {
-            if (items == null) throw new ArgumentNullException(nameof(items));
-            if (dataTable == null) throw new ArgumentNullException(nameof(dataTable));
-            Items = items.ToArray();
             DataTable = dataTable;
+            Items = items.ToArray();
         }
     }
 
@@ -38,16 +38,16 @@ namespace Overby.Data
     public sealed class BulkInserter<T> : IDisposable where T : class
     {
 
-        public string[] RemoveColumns { get; set; }
+        public List<string> RemoveColumns { get; }
 
 
-        public event EventHandler<BulkInsertEventArgs<T>> PreBulkInsert;
+        public event EventHandler<BulkInsertEventArgs<T>>? PreBulkInsert;
         public void OnPreBulkInsert(BulkInsertEventArgs<T> e)
         {
             PreBulkInsert?.Invoke(this, e);
         }
 
-        public event EventHandler<BulkInsertEventArgs<T>> PostBulkInsert;
+        public event EventHandler<BulkInsertEventArgs<T>>? PostBulkInsert;
         public void OnPostBulkInsert(BulkInsertEventArgs<T> e)
         {
             PostBulkInsert?.Invoke(this, e);
@@ -55,9 +55,10 @@ namespace Overby.Data
 
         private const int DefaultBufferSize = 2000;
         private readonly SqlConnection _connection;
-        private readonly int _bufferSize;
-        public int BufferSize { get { return _bufferSize; } }
+
+        public int BufferSize { get; }
         public int InsertedCount { get; private set; }
+        public TimeSpan? BulkCopyTimeout { get; set; }
 
         private readonly Lazy<Dictionary<string, Func<T, object>>> _props =
             new Lazy<Dictionary<string, Func<T, object>>>(GetPropertyInformation);
@@ -67,21 +68,18 @@ namespace Overby.Data
         private readonly bool _constructedSqlBulkCopy;
         private readonly SqlBulkCopy _sbc;
         private readonly List<T> _queue = new List<T>();
-        public TimeSpan? BulkCopyTimeout { get; set; }
-        private readonly SqlTransaction _tran;
+        private readonly SqlTransaction? _tran;
 
         /// <param name="connection">SqlConnection to use for retrieving the schema of sqlBulkCopy.DestinationTableName</param>
         /// <param name="sqlBulkCopy">SqlBulkCopy to use for bulk insert.</param>
         /// <param name="bufferSize">Number of rows to bulk insert at a time. The default is 2000.</param>
         public BulkInserter(SqlConnection connection, SqlBulkCopy sqlBulkCopy, int bufferSize = DefaultBufferSize)
         {
-            if (connection == null) throw new ArgumentNullException(nameof(connection));
-            if (sqlBulkCopy == null) throw new ArgumentNullException(nameof(sqlBulkCopy));
-
-            _bufferSize = bufferSize;
             _connection = connection;
             _sbc = sqlBulkCopy;
             _dt = new Lazy<DataTable>(CreateDataTable);
+            BufferSize = bufferSize;
+            RemoveColumns = new List<string>();
         }
 
         /// <param name="connection">SqlConnection to use for retrieving the schema of sqlBulkCopy.DestinationTableName and for bulk insert.</param>
@@ -89,12 +87,15 @@ namespace Overby.Data
         /// <param name="bufferSize">Number of rows to bulk insert at a time. The default is 2000.</param>
         /// <param name="copyOptions">Options for SqlBulkCopy.</param>
         /// <param name="sqlTransaction">SqlTransaction for SqlBulkCopy</param>
-        public BulkInserter(SqlConnection connection, string tableName, int bufferSize = DefaultBufferSize,
-                            SqlBulkCopyOptions copyOptions = SqlBulkCopyOptions.Default, SqlTransaction sqlTransaction = null)
+        public BulkInserter(SqlConnection connection,
+                            string tableName,
+                            int bufferSize = DefaultBufferSize,
+                            SqlBulkCopyOptions copyOptions = SqlBulkCopyOptions.Default,
+                            SqlTransaction? sqlTransaction = null)
             : this(connection, new SqlBulkCopy(connection, copyOptions, sqlTransaction) { DestinationTableName = tableName }, bufferSize)
         {
             _tran = sqlTransaction;
-            _constructedSqlBulkCopy = true;
+            _constructedSqlBulkCopy = true; //signal that we're responsible for cleaning up the mess we've made
         }
 
         /// <summary>
@@ -145,12 +146,11 @@ namespace Overby.Data
 
         private static IEnumerable<IEnumerable<T>> Buffer(IEnumerable<T> source, int bufferSize)
         {
-
-            using (var enumerator = source.GetEnumerator())
-                while (enumerator.MoveNext())
-                {
-                    yield return YieldBufferElements(enumerator, bufferSize - 1);
-                }
+            using var enumerator = source.GetEnumerator();
+            while (enumerator.MoveNext())
+            {
+                yield return YieldBufferElements(enumerator, bufferSize - 1);
+            }
         }
 
         private static IEnumerable<T> YieldBufferElements(IEnumerator<T> source, int bufferSize)
@@ -173,7 +173,7 @@ namespace Overby.Data
 
             _queue.Add(item);
 
-            if (_queue.Count == _bufferSize)
+            if (_queue.Count == BufferSize)
             {
                 return FlushAsync();
             }
@@ -209,7 +209,7 @@ namespace Overby.Data
         {
             if (typeof(T) != propertyInfo.DeclaringType)
                 throw new ArgumentException(
-                    $"Mismatched types between that requested ({typeof(T).Name}), and that returned by the property ({propertyInfo.DeclaringType.Name}).",
+                    $"Mismatched types between that requested ({typeof(T).Name}), and that returned by the property ({propertyInfo.DeclaringType?.Name}).",
                     propertyInfo.Name);
 
             var instance = Expression.Parameter(propertyInfo.DeclaringType, "i");
@@ -228,18 +228,20 @@ namespace Overby.Data
             var dt = new DataTable();
 
             // get the target shape of the table
-            using (var cmd = _connection.CreateCommand())
+            using var cmd = _connection.CreateCommand();
+            cmd.Transaction = _tran;
+#pragma warning disable CA2100 // Review SQL queries for security vulnerabilities
+            cmd.CommandText = $"select top 0 * from {_sbc.DestinationTableName}";
+#pragma warning restore CA2100 // Review SQL queries for security vulnerabilities
+
+            using var reader = cmd.ExecuteReader();
+            dt.Load(reader);
+
+
+            foreach (var col in RemoveColumns)
             {
-                cmd.Transaction = _tran;
-                cmd.CommandText = $"select top 0 * from {_sbc.DestinationTableName}";
-
-                using (var reader = cmd.ExecuteReader())
-                    dt.Load(reader);
+                dt.Columns.Remove(col);
             }
-
-            if (RemoveColumns != null)
-                foreach (var col in RemoveColumns)
-                    dt.Columns.Remove(col);
 
             return dt;
         }
